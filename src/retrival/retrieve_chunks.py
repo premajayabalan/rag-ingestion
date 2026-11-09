@@ -24,6 +24,7 @@ def retrieve_chunks(question: str, top_k: int = TOP_K):
         register_vector(conn)
 
         with conn.cursor() as cur:
+            cur.execute("SET LOCAL hnsw.ef_search = 100")
             cur.execute(
                 """
                 SELECT
