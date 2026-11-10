@@ -1,4 +1,6 @@
 
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel,Field
@@ -29,7 +31,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    sources: list
+    follow_up_question: Optional[str] = None
 
 
 @app.get("/")
@@ -63,11 +65,11 @@ def chat(request: ChatRequest):
         )
 
         # 3. Generate answer using original question and history
-        answer = generate_answer(
-            question,
-            retrieved_chunks,
-            request.conversation_history
-        )
+        result = generate_answer(
+                    question,
+                    retrieved_chunks,
+                    request.conversation_history
+                )
 
         # 4. Prepare source information
         sources = []
@@ -85,9 +87,10 @@ def chat(request: ChatRequest):
                 "content": content
             })
 
+        
         return {
-            "answer": answer,
-            "sources": sources
+            "answer": result["answer"],
+            "follow_up_question": result["follow_up_question"]
         }
 
     except Exception as error:

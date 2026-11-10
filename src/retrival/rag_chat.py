@@ -1,17 +1,19 @@
 
 import time
 
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from google.genai import types
+from pgvector import Vector
+from sentence_transformers import CrossEncoder
 
 from src.database.connection import get_connection
+from src.embedding.store_chunks import get_gemini_client
 from src.llm.grok_client import grok_generate
+import json
 
 
-# Embedding model used during ingestion
-EMBEDDING_MODEL = "microsoft/harrier-oss-v1-270m"
-
-# Load Harrier once when this module is imported
-embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+# Gemini embedding configuration
+EMBEDDING_MODEL = "gemini-embedding-2"
+EMBEDDING_DIMENSION = 1536
 
 # Load reranker once
 reranker = CrossEncoder(
@@ -46,7 +48,6 @@ def resolve_search_query(question: str, conversation_history):
     if not conversation_history:
         return question
 
-    # Use the last 6 messages for query rewriting
     history = format_conversation_history(
         conversation_history[-6:]
     )
@@ -97,18 +98,53 @@ def retrieve_chunks(
 
     start = time.perf_counter()
 
-    # Number of candidates to retrieve before reranking
     candidate_k = 20
 
-    # 1. Generate query embedding
+    # 1. Generate question embedding using Gemini
     embedding_start = time.perf_counter()
 
     query_text = search_query or question
 
-    query_embedding = embedding_model.encode(
-        query_text,
-        normalize_embeddings=True,
+    client = get_gemini_client()
+
+    response = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=[
+            types.Content(
+                parts=[
+                    types.Part.from_text(
+                        text=f"task: search result | query: {query_text}"
+                    )
+                ]
+            )
+        ],
+        config=types.EmbedContentConfig(
+            output_dimensionality=EMBEDDING_DIMENSION
+        ),
     )
+
+    if not response.embeddings:
+        raise RuntimeError(
+            "Gemini returned an empty query embedding."
+        )
+
+    query_embedding = response.embeddings[0].values
+
+    if not query_embedding:
+        raise RuntimeError(
+            "Gemini returned an empty embedding vector."
+        )
+
+    if len(query_embedding) != EMBEDDING_DIMENSION:
+        raise ValueError(
+            f"Expected {EMBEDDING_DIMENSION} dimensions, "
+            f"received {len(query_embedding)}."
+        )
+
+    # Convert the embedding into pgvector format
+    query_vector = "[" + ",".join(
+    str(value) for value in query_embedding
+) + "]"
 
     embedding_time = time.perf_counter() - embedding_start
 
@@ -137,13 +173,13 @@ def retrieve_chunks(
                     FROM (
                         SELECT
                             id,
-                            embedding <=> %s AS distance
+                            embedding <=> %s::vector AS distance
 
                         FROM document_chunks
 
                         WHERE embedding IS NOT NULL
 
-                        ORDER BY embedding <=> %s
+                        ORDER BY embedding <=> %s::vector
 
                         LIMIT 20
                     ) AS vector_results
@@ -216,15 +252,14 @@ def retrieve_chunks(
                 LIMIT %s;
                 """,
                 (
-                    query_embedding,
-                    query_embedding,
+                    query_vector,
+                    query_vector,
                     query_text,
                     query_text,
                     candidate_k
                 )
             )
 
-            # Fetch results before cursor closes
             candidates = cur.fetchall()
 
         query_time = time.perf_counter() - query_start
@@ -246,7 +281,6 @@ def retrieve_chunks(
             show_progress_bar=False
         )
 
-        # Attach reranker score to each retrieved chunk
         reranked_results = [
             (*chunk, float(score))
             for chunk, score in zip(
@@ -255,13 +289,11 @@ def retrieve_chunks(
             )
         ]
 
-        # Sort using reranker scores in descending order
         reranked_results.sort(
             key=lambda x: x[5],
             reverse=True
         )
 
-        # Select the best top_k chunks
         results = reranked_results[:top_k]
 
     else:
@@ -269,7 +301,7 @@ def retrieve_chunks(
 
     rerank_time = time.perf_counter() - rerank_start
 
-    # 6. Print final reranked chunks
+    # 6. Print final reranked results
     print("\nFinal Reranked Results:")
 
     for rank, row in enumerate(results, start=1):
@@ -302,15 +334,26 @@ def retrieve_chunks(
     return results
 
 
-def generate_answer(question: str, retrieved_chunks, conversation_history=None):
+
+
+
+def generate_answer(
+    question: str,
+    retrieved_chunks,
+    conversation_history=None
+):
     """
-    Generate an answer using Grok and the retrieved document context.
+    Generate an answer and an optional follow-up question
+    using Grok and the retrieved document context.
     """
 
     conversation_history = conversation_history or []
 
     if not retrieved_chunks:
-        return "I couldn't find relevant information in the documents."
+        return {
+            "answer": "I couldn't find relevant information in the documents.",
+            "follow_up_question": None
+        }
 
     context_parts = []
 
@@ -356,14 +399,56 @@ Service distinction:
   claim out instead of using information from another service.
 
 Citation rules:
-- Cite claims using [Source 1], [Source 2], etc.
+- Do not include source citations in the final answer.
+- Do not write [Source 1], [Source 2], or similar references.
+- Answer naturally using the retrieved document context.
+- Do not mention internal chunk IDs or retrieval details.
 - Each citation must directly support the claim it follows.
 - Do not cite a source merely because it discusses a related topic.
 - Never invent source numbers.
 - Do not use information from an unrelated service to support an answer.
+
+CONVERSATIONAL BEHAVIOUR:
+
+1. First, answer the user's question using the retrieved context.
+2. Decide whether asking a follow-up question would genuinely improve
+   the conversation.
+3. Ask a follow-up question only when:
+   - The user's requirement is broad or unclear.
+   - More information is needed to provide a useful recommendation.
+   - There is a relevant next step worth exploring.
+   - The user appears to want guidance or assistance.
+4. Do not ask a follow-up question when:
+   - The user's question is straightforward and completely answered.
+   - The answer does not require additional information.
+   - A follow-up would feel forced or repetitive.
+5. Ask at most ONE follow-up question.
+6. Make the follow-up specific to the user's question and conversation history.
+7. Never ask generic questions such as "Is there anything else?"
+8. Do not invent information when asking follow-up questions.
+9. If no follow-up is needed, return null.
+
+OUTPUT FORMAT:
+- Return ONLY valid JSON.
+- Do not include Markdown code fences.
+- The answer field must contain only the actual answer.
+- The follow_up_question field must contain one question or null.
+
+Expected structure:
+
+{
+    "answer": "Your answer here",
+    "follow_up_question": "Your follow-up question here"
+}
+
+If no follow-up is needed:
+
+{
+    "answer": "Your answer here",
+    "follow_up_question": null
+}
 """
 
-    # Preserve previous conversation context
     history = format_conversation_history(
         conversation_history
     )
@@ -380,21 +465,48 @@ Document context:
 User question:
 {question}
 
-Provide a clear answer with source citations.
+Provide the answer and optional follow-up question
+in the required JSON format.
 """
 
-    # Generate answer using Grok API
-    answer = grok_generate(
+    response = grok_generate(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         timeout=180
     )
 
-    return answer.strip()
+    try:
+        result = json.loads(response.strip())
+
+        answer = result.get("answer", "")
+        follow_up_question = result.get("follow_up_question")
+
+        if not isinstance(answer, str):
+            raise ValueError("Answer must be a string")
+
+        if follow_up_question is not None and not isinstance(
+            follow_up_question, str
+        ):
+            follow_up_question = None
+
+        return {
+            "answer": answer,
+            "follow_up_question": follow_up_question
+        }
+
+    except (json.JSONDecodeError, ValueError):
+        return {
+            "answer": response.strip(),
+            "follow_up_question": None
+        }
+
 
 
 def main():
-    question = input("Ask a question about your documents: ").strip()
+
+    question = input(
+        "Ask a question about your documents: "
+    ).strip()
 
     if not question:
         print("Please enter a question.")
@@ -410,7 +522,10 @@ def main():
 
     print(f"Retrieved {len(retrieved_chunks)} chunks.")
 
-    answer = generate_answer(question, retrieved_chunks)
+    answer = generate_answer(
+        question,
+        retrieved_chunks
+    )
 
     print("\nAnswer:")
     print(answer)

@@ -1,5 +1,8 @@
+
 import re
 import json
+import time
+
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional
@@ -25,12 +28,14 @@ class Chunk:
 
 
 class StructureAwareChunker:
+
     def __init__(
         self,
         chunk_size: int = 600,
         chunk_overlap: int = 100,
         model_name: str = MODEL_NAME,
     ):
+
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
 
@@ -41,18 +46,20 @@ class StructureAwareChunker:
 
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         # Higher scores indicate preferred split boundaries.
         self.boundary_rules = [
-            (r"(?m)(?=^#{1,6}\s+)", 100),  # Heading
-            (r"\n\s*\n", 60),             # Paragraph
-            (r"(?<=[.!?])\s+", 40),       # Sentence
-            (r"\n", 30),                  # Line
-            (r"\s+", 5),                  # Word
+            (r"(?m)(?=^#{1,6}\s+)", 100),
+            (r"\n\s*\n", 60),
+            (r"(?<=[.!?])\s+", 40),
+            (r"\n", 30),
+            (r"\s+", 5),
         ]
 
     def count_tokens(self, text: str) -> int:
+
         return len(
             self.tokenizer.encode(
                 text,
@@ -62,26 +69,48 @@ class StructureAwareChunker:
 
     def split_markdown_into_sections(self, markdown: str):
         """
-        Split Markdown into heading-based sections while
-        preserving the complete heading hierarchy.
+        Split Markdown into heading-based sections.
+
+        Ignore sections containing only a heading and whitespace.
+        Preserve the heading hierarchy for all meaningful sections.
         """
+
         sections = []
         heading_stack = []
         current_lines = []
 
         def save_section():
+
             content = "\n".join(current_lines).strip()
 
-            if content:
-                sections.append({
-                    "content": content,
-                    "section_path": " > ".join(heading_stack),
-                })
+            if not content:
+                return
+
+            # Remove Markdown heading lines to check whether
+            # the section contains actual content.
+            body_lines = [
+                line
+                for line in current_lines
+                if not re.match(r"^#{1,6}\s+", line.strip())
+            ]
+
+            body = "\n".join(body_lines).strip()
+
+            # Skip heading-only sections.
+            if not body:
+                return
+
+            sections.append({
+                "content": content,
+                "section_path": " > ".join(heading_stack),
+            })
 
         for line in markdown.splitlines():
+
             match = re.match(r"^(#{1,6})\s+(.+)$", line)
 
             if match:
+
                 save_section()
                 current_lines.clear()
 
@@ -92,20 +121,25 @@ class StructureAwareChunker:
                 heading_stack.append(heading)
 
                 current_lines.append(line)
+
             else:
                 current_lines.append(line)
 
         save_section()
+
         return sections
 
     def _find_split_candidates(self, text: str):
         """
         Find candidate boundaries and assign their rule scores.
         """
+
         candidates = []
 
         for pattern, score in self.boundary_rules:
+
             for match in re.finditer(pattern, text):
+
                 start = match.start()
                 end = match.end()
 
@@ -122,15 +156,19 @@ class StructureAwareChunker:
 
     def _choose_split(self, text: str, max_tokens: int):
         """
-        Select a high-scoring boundary that fits within the
-        maximum token limit.
+        Select a high-scoring boundary that fits within
+        the maximum token limit.
         """
+
         candidates = self._find_split_candidates(text)
+
         best_candidate = None
         best_score = float("-inf")
 
         for candidate in candidates:
+
             left = text[:candidate["left_end"]].strip()
+
             right = text[candidate["right_start"]:].strip()
 
             if not left or not right:
@@ -141,14 +179,14 @@ class StructureAwareChunker:
             if left_tokens > max_tokens:
                 continue
 
-            # Prefer boundaries close to the token limit,
-            # while giving structural boundaries more weight.
             closeness = left_tokens / max_tokens
+
             combined_score = (
                 candidate["score"] + (25 * closeness)
             )
 
             if combined_score > best_score:
+
                 best_score = combined_score
                 best_candidate = (left, right)
 
@@ -159,6 +197,7 @@ class StructureAwareChunker:
         Recursively split oversized text using scored
         structural boundaries.
         """
+
         text = text.strip()
 
         if not text:
@@ -184,6 +223,7 @@ class StructureAwareChunker:
         Last-resort token splitting when no suitable
         structural boundary exists.
         """
+
         token_ids = self.tokenizer.encode(
             text,
             add_special_tokens=False,
@@ -192,6 +232,7 @@ class StructureAwareChunker:
         result = []
 
         for start in range(0, len(token_ids), max_tokens):
+
             window = token_ids[start:start + max_tokens]
 
             decoded = self.tokenizer.decode(
@@ -208,6 +249,7 @@ class StructureAwareChunker:
         """
         Infer the dominant Markdown content type.
         """
+
         lines = text.splitlines()
 
         if any(
@@ -229,15 +271,20 @@ class StructureAwareChunker:
         Pack recursive pieces into chunks without exceeding
         the given token limit.
         """
+
         packed = []
         current = []
 
         for piece in pieces:
+
             candidate = "\n\n".join(current + [piece])
 
             if self.count_tokens(candidate) <= max_tokens:
+
                 current.append(piece)
+
             else:
+
                 if current:
                     packed.append("\n\n".join(current))
 
@@ -254,12 +301,17 @@ class StructureAwareChunker:
         document_id: Optional[str] = None,
         source_file: Optional[str] = None,
     ):
+        """
+        Generate structure-aware chunks from Markdown.
+        """
+
         sections = self.split_markdown_into_sections(markdown)
 
         chunks = []
         chunk_id = 0
 
         for section in sections:
+
             section_path = section["section_path"]
             content = section["content"]
 
@@ -270,6 +322,7 @@ class StructureAwareChunker:
             )
 
             prefix_tokens = self.count_tokens(heading_prefix)
+
             available_tokens = self.chunk_size - prefix_tokens
 
             if available_tokens <= 0:
@@ -277,7 +330,6 @@ class StructureAwareChunker:
                     "Section heading exceeds the configured chunk size."
                 )
 
-            # Reserve space for overlap in every chunk.
             new_content_capacity = (
                 available_tokens - self.chunk_overlap
             )
@@ -301,12 +353,14 @@ class StructureAwareChunker:
             previous_token_ids = []
 
             for index, raw_chunk in enumerate(raw_chunks):
+
                 current_token_ids = self.tokenizer.encode(
                     raw_chunk,
                     add_special_tokens=False,
                 )
 
                 if index > 0 and self.chunk_overlap > 0:
+
                     overlap_ids = previous_token_ids[
                         -self.chunk_overlap:
                     ]
@@ -315,7 +369,7 @@ class StructureAwareChunker:
                         overlap_ids + current_token_ids
                     )
 
-                # Defensive hard-limit enforcement.
+                # Enforce the maximum available token capacity.
                 current_token_ids = current_token_ids[
                     :available_tokens
                 ]
@@ -326,6 +380,7 @@ class StructureAwareChunker:
                 ).strip()
 
                 chunk_content = heading_prefix + chunk_body
+
                 token_count = self.count_tokens(chunk_content)
 
                 if token_count > self.chunk_size:
@@ -355,6 +410,7 @@ class StructureAwareChunker:
                 )
 
                 chunk_id += 1
+
                 previous_token_ids = self.tokenizer.encode(
                     chunk_body,
                     add_special_tokens=False,
@@ -363,7 +419,78 @@ class StructureAwareChunker:
         return chunks
 
 
+def classify_chunks(chunks):
+    """
+    Classify every chunk and attach classification results
+    to its metadata.
+
+    Each chunk makes one call to the complete classification
+    pipeline, including one Grok assessment.
+    """
+
+    total_start = time.perf_counter()
+
+    for chunk in chunks:
+
+        chunk_start = time.perf_counter()
+
+        result = classify_chunk(chunk.content)
+
+        classification_time = time.perf_counter() - chunk_start
+
+        chunk.metadata.update({
+            "classification": result["classification"].name,
+            "classification_score": result["score"],
+            "classification_reason": result["reason"],
+            "classification_time_seconds": round(
+                classification_time, 3
+            ),
+        })
+
+        # Store detector summaries for debugging and auditing.
+        chunk.metadata["classification_details"] = {
+
+            "rule_detector": {
+                "classification": (
+                    result["rule_result"]["classification"].name
+                ),
+                "score": result["rule_result"]["score"],
+                "matches": result["rule_result"]["matches"],
+            },
+
+            "pii_detector": {
+                "classification": (
+                    result["pii_result"]["classification"].name
+                ),
+                "score": result["pii_result"]["score"],
+                "matches": result["pii_result"]["matches"],
+            },
+
+            "grok_detector": {
+                "classification": (
+                    result["llm_result"]["classification"].name
+                ),
+                "score": result["llm_result"]["score"],
+                "reason": result["llm_result"]["reason"],
+                "confidence": result["llm_result"]["confidence"],
+            },
+        }
+
+        print(
+            f"Chunk {chunk.chunk_index}: "
+            f"{result['classification'].name} | "
+            f"Score: {result['score']} | "
+            f"Tokens: {chunk.token_count} | "
+            f"Time: {classification_time:.3f}s"
+        )
+
+    total_time = time.perf_counter() - total_start
+
+    return total_time
+
+
 if __name__ == "__main__":
+
     input_file = Path("output/extracted/sample.md")
     output_file = Path("output/chunks/chunks.json")
 
@@ -374,29 +501,53 @@ if __name__ == "__main__":
         chunk_overlap=100,
     )
 
+    # Step 1: Generate chunks.
     chunks = chunker.create_chunks(
         markdown,
         document_id="sample-document-001",
         source_file=input_file.name,
     )
 
-    # Classify each chunk and attach classification metadata.
+    print("\n" + "=" * 70)
+    print("CHUNK GENERATION")
+    print("=" * 70)
+
+    print(f"Generated chunks: {len(chunks)}")
+
+    # Step 2: Classify every generated chunk.
+    print("\n" + "=" * 70)
+    print("CHUNK CLASSIFICATION")
+    print("=" * 70)
+
+    classification_time = classify_chunks(chunks)
+
+    # Step 3: Display classification summary.
+    summary = {
+        "PUBLIC": 0,
+        "INTERNAL": 0,
+        "CONFIDENTIAL": 0,
+    }
+
     for chunk in chunks:
-        result = classify_chunk(chunk.content)
+        summary[chunk.metadata["classification"]] += 1
 
-        chunk.metadata.update({
-            "classification": result["classification"].name,
-            "classification_score": result["score"],
-            "classification_reason": result["reason"],
-        })
+    print("\n" + "=" * 70)
+    print("CLASSIFICATION SUMMARY")
+    print("=" * 70)
 
-        print(
-            f"Chunk {chunk.chunk_index}: "
-            f"{result['classification'].name} "
-            f"(score: {result['score']})"
-        )
+    for label, count in summary.items():
+        print(f"{label}: {count}")
 
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        f"\nTotal classification time: "
+        f"{classification_time:.3f} seconds"
+    )
+
+    # Step 4: Save chunks and metadata.
+    output_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     output_file.write_text(
         json.dumps(
@@ -406,6 +557,10 @@ if __name__ == "__main__":
         ),
         encoding="utf-8",
     )
+
+    print("\n" + "=" * 70)
+    print("OUTPUT")
+    print("=" * 70)
 
     print(f"Created {len(chunks)} chunks")
     print(f"Saved chunks to: {output_file}")

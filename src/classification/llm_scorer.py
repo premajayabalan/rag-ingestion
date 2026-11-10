@@ -1,17 +1,13 @@
 
 import json
-import requests
 
 from src.classification.labels import Classification
-
-
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "qwen3:8b"
+from src.llm.grok_client import grok_generate
 
 
 def score_chunk(text: str) -> dict:
     """
-    Evaluate document sensitivity using Qwen3:8B.
+    Evaluate document sensitivity using Grok.
 
     Returns:
         {
@@ -24,7 +20,7 @@ def score_chunk(text: str) -> dict:
 
     document_json = json.dumps(text, ensure_ascii=False)
 
-    prompt = f"""
+    system_prompt = """
 You are an enterprise information security classification system.
 
 OBJECTIVE:
@@ -219,104 +215,84 @@ Score: 5
 Classification: PUBLIC
 
 OUTPUT:
-Return only valid JSON matching the required schema.
+Return only valid JSON. Do not include Markdown fences or explanations.
+
+Required schema:
+{
+    "score": integer between 0 and 100,
+    "classification": "PUBLIC", "INTERNAL", or "CONFIDENTIAL",
+    "reason": "Brief explanation of the evidence and sensitivity",
+    "confidence": number between 0.0 and 1.0
+}
+
 The score and classification must agree with the score ranges.
 The reason must briefly identify the evidence and explain its sensitivity.
 Confidence must be a number between 0.0 and 1.0.
+"""
+
+    user_prompt = f"""
+Classify the following document content according to the
+security classification rules.
 
 DOCUMENT CONTENT (JSON-encoded):
 {document_json}
-
-/no_think
 """
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        "format": {
-            "type": "object",
-            "properties": {
-                "score": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 100,
-                },
-                "classification": {
-                    "type": "string",
-                    "enum": [
-                        "PUBLIC",
-                        "INTERNAL",
-                        "CONFIDENTIAL",
-                    ],
-                },
-                "reason": {
-                    "type": "string",
-                },
-                "confidence": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 1,
-                },
-            },
-            "required": [
-                "score",
-                "classification",
-                "reason",
-                "confidence",
-            ],
-        },
-        "think": False,
-        "stream": False,
-        "options": {
-            "temperature": 0,
-            "num_predict": 500,
-        },
-    }
-
-    response = requests.post(
-        OLLAMA_URL,
-        json=payload,
-        timeout=180,
-    )
-    response.raise_for_status()
-
-    response_data = response.json()
-    response_text = (
-        response_data.get("message", {})
-        .get("content", "")
-        .strip()
+    # Call Grok through our existing shared API client.
+    response_text = grok_generate(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        timeout=120,
     )
 
     if not response_text:
-        raise ValueError(
-            "Ollama returned an empty response. "
-            f"Full response: {response_data}"
-        )
+        raise ValueError("Grok returned an empty classification response.")
 
     try:
         result = json.loads(response_text)
     except json.JSONDecodeError as exc:
         raise ValueError(
-            f"Ollama returned invalid JSON: {response_text!r}"
+            f"Grok returned invalid classification JSON: {response_text!r}"
         ) from exc
 
+    if not isinstance(result, dict):
+        raise ValueError("Grok classification response must be a JSON object.")
+
     score = result.get("score")
-    if not isinstance(score, int) or not 0 <= score <= 100:
-        raise ValueError(f"Invalid sensitivity score: {score!r}")
+
+    if (
+        isinstance(score, bool)
+        or not isinstance(score, int)
+        or not 0 <= score <= 100
+    ):
+        raise ValueError(f"Invalid sensitivity score from Grok: {score!r}")
 
     confidence = result.get("confidence")
+
     if (
-        not isinstance(confidence, (int, float))
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
         or not 0 <= confidence <= 1
     ):
-        raise ValueError(f"Invalid confidence: {confidence!r}")
+        raise ValueError(f"Invalid confidence from Grok: {confidence!r}")
 
-    # Application-side thresholds are authoritative.
+    model_classification = result.get("classification")
+
+    if model_classification not in (
+        "PUBLIC",
+        "INTERNAL",
+        "CONFIDENTIAL",
+    ):
+        raise ValueError(
+            f"Invalid classification returned by Grok: {model_classification!r}"
+        )
+
+    reason = result.get("reason")
+
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("Grok returned an empty or invalid classification reason.")
+
+    # Application-side thresholds remain authoritative.
     if score < 30:
         classification = Classification.PUBLIC
     elif score < 70:
@@ -327,7 +303,7 @@ DOCUMENT CONTENT (JSON-encoded):
     return {
         "score": score,
         "classification": classification,
-        "reason": str(result.get("reason", "")),
+        "reason": reason.strip(),
         "confidence": float(confidence),
     }
 
@@ -350,7 +326,7 @@ if __name__ == "__main__":
     for sample in samples:
         result = score_chunk(sample)
 
-        print("\\nDocument:", sample)
+        print("\nDocument:", sample)
         print("Score:", result["score"])
         print("Classification:", result["classification"].name)
         print("Confidence:", result["confidence"])
