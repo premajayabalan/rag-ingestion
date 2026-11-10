@@ -1,10 +1,11 @@
 
-import requests
-from pgvector.psycopg import register_vector
-from sentence_transformers import SentenceTransformer,CrossEncoder
+import time
+
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from src.database.connection import get_connection
-import time
+from src.llm.grok_client import grok_generate
+
 
 # Embedding model used during ingestion
 EMBEDDING_MODEL = "microsoft/harrier-oss-v1-270m"
@@ -12,33 +13,45 @@ EMBEDDING_MODEL = "microsoft/harrier-oss-v1-270m"
 # Load Harrier once when this module is imported
 embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 
+# Load reranker once
 reranker = CrossEncoder(
     "BAAI/bge-reranker-v2-m3"
 )
-# Local Ollama LLM
-OLLAMA_URL = "http://localhost:11434/api/chat"
-LLM_MODEL = "qwen3:8b"
 
 TOP_K = 5
 
+
+def format_conversation_history(conversation_history):
+    """
+    Convert conversation history into a readable format
+    that can be included in Grok's user prompt.
+    """
+
+    history_parts = []
+
+    for message in conversation_history:
+        history_parts.append(
+            f"{message.role}: {message.content}"
+        )
+
+    return "\n".join(history_parts)
+
+
 def resolve_search_query(question: str, conversation_history):
+    """
+    Rewrite the latest user question into a standalone
+    search query using previous conversation history.
+    """
+
     if not conversation_history:
         return question
 
-    history = []
+    # Use the last 6 messages for query rewriting
+    history = format_conversation_history(
+        conversation_history[-6:]
+    )
 
-    for message in conversation_history[-6:]:
-        history.append({
-            "role": message.role,
-            "content": message.content
-        })
-
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": """
+    system_prompt = """
 You are a search query rewriting assistant.
 
 Your task is to rewrite the latest user question
@@ -54,33 +67,25 @@ Rules:
 - If the reference is ambiguous, return the original question.
 - Return only the rewritten question.
 """
-            },
-            *history,
-            {
-                "role": "user",
-                "content": question
-            }
-        ],
-        "stream": False,
-        "think": False,
-        "options": {
-            "temperature": 0,
-            "num_predict": 100
-        }
-    }
 
-    response = requests.post(
-        OLLAMA_URL,
-        json=payload,
+    user_prompt = f"""
+Conversation history:
+
+{history}
+
+Latest user question:
+{question}
+
+Return only the rewritten search query.
+"""
+
+    resolved_query = grok_generate(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
         timeout=60
     )
 
-    response.raise_for_status()
-
-    resolved_query = response.json()["message"]["content"].strip()
-
-    return resolved_query or question
-
+    return resolved_query.strip() or question
 
 
 def retrieve_chunks(
@@ -298,8 +303,11 @@ def retrieve_chunks(
 
 
 def generate_answer(question: str, retrieved_chunks, conversation_history=None):
+    """
+    Generate an answer using Grok and the retrieved document context.
+    """
+
     conversation_history = conversation_history or []
-    """Generate an answer using the retrieved document context."""
 
     if not retrieved_chunks:
         return "I couldn't find relevant information in the documents."
@@ -307,6 +315,7 @@ def generate_answer(question: str, retrieved_chunks, conversation_history=None):
     context_parts = []
 
     for rank, chunk in enumerate(retrieved_chunks, start=1):
+
         chunk_id, content, section_path, metadata, rrf_score, reranker_score = chunk
 
         context_parts.append(
@@ -354,7 +363,16 @@ Citation rules:
 - Do not use information from an unrelated service to support an answer.
 """
 
+    # Preserve previous conversation context
+    history = format_conversation_history(
+        conversation_history
+    )
+
     user_prompt = f"""
+Previous conversation history:
+
+{history if history else "No previous conversation."}
+
 Document context:
 
 {context}
@@ -364,46 +382,15 @@ User question:
 
 Provide a clear answer with source citations.
 """
-    messages = [
-    {"role": "system", "content": system_prompt}
-]
 
-# Add previous conversation messages
-    for message in conversation_history:
-        messages.append({
-        "role": message.role,
-        "content": message.content
-    })
-
-# Add the current user question and retrieved context
-    messages.append({
-    "role": "user",
-    "content": user_prompt
-    })
-
-    payload = {
-    "model": LLM_MODEL,
-    "messages": messages,
-    "stream": False,
-    "think": False,
-    "keep_alive": "10m",
-    "options": {
-        "temperature": 0,
-        "num_ctx": 4096,
-        "num_predict": 512,
-    },
-}
-
-
-    response = requests.post(
-        OLLAMA_URL,
-        json=payload,
-        timeout=180,
+    # Generate answer using Grok API
+    answer = grok_generate(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        timeout=180
     )
 
-    response.raise_for_status()
-
-    return response.json()["message"]["content"].strip()
+    return answer.strip()
 
 
 def main():
@@ -429,7 +416,9 @@ def main():
     print(answer)
 
     print("\nRetrieved sources:")
+
     for rank, chunk in enumerate(retrieved_chunks, start=1):
+
         chunk_id, content, section_path, metadata, rrf_score, reranker_score = chunk
 
         print(f"\n[Source {rank}] Chunk ID: {chunk_id}")
@@ -441,4 +430,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
