@@ -1,0 +1,11 @@
+[
+  {
+    "id": "replace-with-stable-id",
+    "input": "Add a real question grounded in the FI knowledge base.",
+    "expected_output": "Add a human-verified reference answer.",
+    "reference_context": ["Add the exact source passage(s) supporting the answer."],
+    "conversation_history": [],
+    "enabled": false,
+    "notes": "Template only. Replace with a verified example and set enabled to true."
+  }
+]

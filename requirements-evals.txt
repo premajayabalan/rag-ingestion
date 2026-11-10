@@ -1,0 +1,4 @@
+# Install alongside the existing backend requirements/environment.
+deepeval>=2.0.0
+langsmith>=0.3.0
+python-dotenv>=1.0.0
